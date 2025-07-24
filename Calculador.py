@@ -87,7 +87,7 @@ formato_default = pd.DataFrame(
 
 st.sidebar.header("⚙️ Parámetros")
 st.sidebar.write("**Edita los formatos por material/espesor** (si tu proveedor usa otro formato):")
- formatos_user = st.sidebar.data_editor(
+formatos_user = st.sidebar.data_editor(
     formato_default.copy(),
     num_rows="dynamic",
     use_container_width=True,
