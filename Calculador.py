@@ -1,6 +1,7 @@
 import math
 from io import BytesIO
 
+import chardet
 import pandas as pd
 import streamlit as st
 
@@ -68,6 +69,64 @@ def make_download_link_excel(dfs: dict, filename: str = "resumen_consumos.xlsx")
     )
 
 
+def detectar_separador(file_bytes):
+    """Detecta el separador más probable en un archivo CSV."""
+    sample = file_bytes.decode("utf-8", errors="ignore")
+    if sample.count(";") > sample.count(","):
+        return ";"
+    return ","
+
+
+def corregir_nombres_columnas(cols, mapping):
+    """Corrige nombres de columnas usando un mapping flexible."""
+    cols_corr = []
+    for c in cols:
+        c_norm = c.strip().lower().replace(" ", "_")
+        encontrado = False
+        for canonico, variantes in mapping.items():
+            if c_norm in variantes:
+                cols_corr.append(canonico)
+                encontrado = True
+                break
+        if not encontrado:
+            cols_corr.append(c)
+    return cols_corr
+
+
+def cargar_archivo_piezas(uploaded_file, columnas_esperadas, mapping_columnas):
+    """Carga robusta de archivos CSV/XLSX, detecta separador y corrige nombres."""
+    if uploaded_file is None:
+        return None, None
+
+    try:
+        if uploaded_file.name.endswith(".csv"):
+            # Detectar encoding y separador
+            file_bytes = uploaded_file.read()
+            encoding = chardet.detect(file_bytes)["encoding"] or "utf-8"
+            sep = detectar_separador(file_bytes)
+            df = pd.read_csv(BytesIO(file_bytes), sep=sep, encoding=encoding)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as e:
+        st.error(f"❌ Error al leer el archivo: {e}")
+        return None, None
+
+    # Corregir nombres de columnas
+    df.columns = corregir_nombres_columnas(df.columns, mapping_columnas)
+
+    # Mostrar columnas detectadas y primeras filas
+    st.info(f"Columnas detectadas: {list(df.columns)}")
+    st.dataframe(df.head(), use_container_width=True)
+
+    # Validar columnas requeridas
+    faltantes = [col for col in columnas_esperadas if col not in df.columns]
+    if faltantes:
+        st.warning(f"⚠️ Faltan columnas requeridas: {faltantes}")
+        return None, df  # Devuelve el df para inspección, pero no procesa
+
+    return df, None
+
+
 # ------------------------------------------------------------------
 # Base de datos de formatos por material (puedes editarla en la app)
 # ------------------------------------------------------------------
@@ -107,13 +166,133 @@ with tab1:
         st.info("Sube tu archivo para comenzar, o usa el ejemplo en la pestaña 'Plantillas & Ayuda'.")
         df_piezas = None
     else:
-        if uploaded_piezas.name.endswith(".csv"):
-            df_piezas = pd.read_csv(uploaded_piezas, sep=",", decimal=".")
-        else:
-            df_piezas = pd.read_excel(uploaded_piezas)
+        # --- Configura tus columnas esperadas y mapping de nombres ---
+        columnas_esperadas = [
+            "Nombre", "Material", "Espesor_mm", "Largo_mm", "Ancho_mm", "Cantidad", "OrientacionVeta"
+        ]
+        mapping_columnas = {
+            "Nombre": {"nombre", "name"},
+            "Material": {"material"},
+            "Espesor_mm": {"espesor_mm", "espesor", "grosor", "thickness"},
+            "Largo_mm": {"largo_mm", "largo", "longitud", "alto", "altura", "length", "height"},
+            "Ancho_mm": {"ancho_mm", "ancho", "width"},
+            "Cantidad": {"cantidad", "qty", "cantidad_piezas", "numero"},
+            "OrientacionVeta": {"orientacionveta", "veta", "orientacion", "orientación", "orientacion_veta"},
+        }
 
-        st.subheader("Datos cargados")
-        st.dataframe(df_piezas, use_container_width=True, height=300)
+        df_piezas, error_df = cargar_archivo_piezas(uploaded_piezas, columnas_esperadas, mapping_columnas)
+        if error_df is not None:
+            st.info("Corrige tu archivo y vuelve a intentarlo.")
+        elif df_piezas is not None:
+            st.success("Archivo cargado correctamente y listo para procesar.")
+            # Aquí continúa tu lógica de procesamiento...
+
+            # Normalización de claves de materiales para empatar con la tabla de formatos
+            df_piezas["Material_key"] = df_piezas["Material"].apply(normaliza_material)
+            formatos_user["Material_key"] = formatos_user["Material_key"].apply(normaliza_material)
+
+            # Merge para traer largo/ancho de formato (si el usuario no lo puso en la fila)
+            df_merge = pd.merge(
+                df_piezas,
+                formatos_user,
+                how="left",
+                left_on=["Material_key", "Espesor_mm"],
+                right_on=["Material_key", "Espesor_mm"],
+                suffixes=("", "_fmt"),
+            )
+
+            # Si el usuario especificó manualmente Largo_formato_mm/Ancho_formato_mm en df_piezas, respétalo; si no, usa el del merge
+            if "Largo_formato_mm" not in df_merge.columns:
+                df_merge["Largo_formato_mm"] = df_merge["Largo_formato_mm_fmt"]
+            else:
+                df_merge["Largo_formato_mm"] = df_merge["Largo_formato_mm"].fillna(df_merge["Largo_formato_mm_fmt"])
+            if "Ancho_formato_mm" not in df_merge.columns:
+                df_merge["Ancho_formato_mm"] = df_merge["Ancho_formato_mm_fmt"]
+            else:
+                df_merge["Ancho_formato_mm"] = df_merge["Ancho_formato_mm"].fillna(df_merge["Ancho_formato_mm_fmt"])
+
+            # Cálculo de áreas
+            df_merge["Area_m2"] = (
+                df_merge["Largo_mm"] * df_merge["Ancho_mm"] * df_merge["Cantidad"] / 1_000_000
+            )
+
+            # Área de la plancha
+            df_merge["Area_plancha_m2"] = (
+                df_merge["Largo_formato_mm"] * df_merge["Ancho_formato_mm"] / 1_000_000
+            )
+
+            # Validación básica de vetas (no optimiza, solo avisa)
+            def valida_veta(row):
+                orient = str(row.get("OrientacionVeta", "LIBRE")).upper()
+                Lp = row["Largo_mm"]
+                Ap = row["Ancho_mm"]
+                Lf = row["Largo_formato_mm"]
+                Af = row["Ancho_formato_mm"]
+                if orient == "LIBRE" or pd.isna(Lf) or pd.isna(Af):
+                    return "OK"
+                # Consideramos la veta a lo largo del LARGO del formato (Lf)
+                # H => la veta de la pieza va a lo largo del LARGO de la pieza; entonces Lp debe caber en Lf
+                # V => la veta va a lo largo del ANCHO de la pieza; entonces Ap debe caber en Lf
+                try:
+                    if orient == "H" and Lp > max(Lf, Af):
+                        return "Largo pieza > largo vetado del formato"
+                    if orient == "V" and Ap > max(Lf, Af):
+                        return "Ancho pieza > largo vetado del formato"
+                    return "OK"
+                except Exception:
+                    return "OK"
+
+            df_merge["Check_veta"] = df_merge.apply(valida_veta, axis=1)
+
+            st.subheader("Resultado por pieza (con validación de veta)")
+            st.dataframe(df_merge, use_container_width=True, height=400)
+
+            # Resumen por material/espesor
+            resumen = (
+                df_merge.groupby(["Material", "Material_key", "Espesor_mm", "Area_plancha_m2"], dropna=False)["Area_m2"]
+                .sum()
+                .reset_index()
+            )
+            resumen["Planchas_necesarias"] = resumen.apply(
+                lambda r: ceil_div(r["Area_m2"], r["Area_plancha_m2"]) if r["Area_plancha_m2"] > 0 else 0,
+                axis=1,
+            )
+            resumen["Rendimiento_%"] = (
+                (resumen["Area_m2"] / (resumen["Planchas_necesarias"] * resumen["Area_plancha_m2"]).replace(0, pd.NA))
+                * 100
+            )
+
+            st.subheader("🧾 Resumen por material / espesor")
+            st.dataframe(resumen, use_container_width=True)
+
+            # Avance: flags de veta problemáticos
+            problemas_veta = df_merge[df_merge["Check_veta"] != "OK"]
+            if len(problemas_veta):
+                st.warning("⚠️ Se encontraron piezas que podrían violar la orientación de la veta.")
+                st.dataframe(problemas_veta, use_container_width=True)
+
+            # ------------------------------------------------------------------
+            # CANTOS
+            # ------------------------------------------------------------------
+            if df_cantos is not None:
+                df_cantos = df_cantos.copy()
+                df_cantos["Tipo"] = df_cantos["Tipo"].astype(str)
+                df_cantos["Metros_lineales"] = df_cantos["Longitud_mm"] * df_cantos["Cantidad"] / 1000
+                cantos_resumen = df_cantos.groupby("Tipo")["Metros_lineales"].sum().reset_index()
+
+                st.subheader("📏 Metros lineales de canto por tipo")
+                st.dataframe(cantos_resumen, use_container_width=True)
+            else:
+                cantos_resumen = pd.DataFrame(columns=["Tipo", "Metros_lineales"])  # vacío
+
+            # Descarga a Excel
+            make_download_link_excel(
+                {
+                    "Piezas_con_vetas": df_merge,
+                    "Resumen_materiales": resumen,
+                    "Cantos": cantos_resumen,
+                }
+            )
 
 with tab2:
     uploaded_cantos = st.file_uploader("Sube tu archivo de cantos (CSV o XLSX)", type=["csv", "xlsx"], key="cantos")
